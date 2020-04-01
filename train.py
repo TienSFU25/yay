@@ -80,18 +80,20 @@ class AttnDecoderRNN(nn.Module):
         return hidden, context
 
     def forward(self, input, last_hidden, aligned_encoder_output):
-        # hidden = self.init_hidden(input)
+        # input = B * 1 (16 * 1)
         # B * D => B * 1 * D
         aligned = aligned_encoder_output.unsqueeze(1)
         embedded = self.embedding(input)
 
+        # B * 1 * (3D) (16 * 1 * 192)
         concatted = torch.cat((aligned, embedded), 2)
+        # concatted = _concatted.squeeze(1)
 
-        # [16, 60, 64]
-        # [2, 16, 64]
-        lstm_output, next_hidden = self.lstm(concatted, last_hidden)
+        # B * 1 * D / 1 * B * D
+        _lstm_output, next_hidden = self.lstm(concatted, last_hidden)
+        lstm_output = _lstm_output.squeeze(1)
         slot_output = self.slot_out(lstm_output)
-        softmaxed = F.log_softmax(slot_output, dim=2)
+        softmaxed = F.log_softmax(slot_output, dim=1)
 
         return softmaxed, next_hidden
 
@@ -111,28 +113,45 @@ def trainny(input_tensor, target_tensor, encoder, decoder, encoder_optimizer, de
     decoder_input = Variable(torch.LongTensor([[decoder_start_token]*config.batch_size])).transpose(1, 0)
 
     aligned = encoder_outputs.transpose(0, 1)
+    # slot_scores_raw = []
 
     for di in range(target_length):
         # decoder_input = encoder_outputs[di]
         decoder_output, decoder_hidden = decoder(decoder_input, decoder_hidden, aligned[di])
-        pdb.set_trace()
-        # topv, topi = decoder_output.topk(1)
-        # decoder_input = topi.squeeze().detach()  # detach from history as input
+        # pdb.set_trace()
 
-        loss += criterion(decoder_output, target_tensor[di])
-        if decoder_input.item() == EOS_token:
-            break
+        topv, topi = decoder_output.topk(1)
+        decoder_input = topi.detach()  # detach from history as input
+
+        # 1 * slot_size / 1 * 1
+        batch_target = target_tensor[:, di]
+        loss += criterion(decoder_output, batch_target)
 
     loss.backward()
 
     encoder_optimizer.step()
     decoder_optimizer.step()
 
-    return loss.item() / target_length
+    return loss.item()
+
+def eval_single(input_tensor, target_tensor, encoder, decoder):
+    criterion = nn.NLLLoss()
+
+def evaluate(test_data, encoder, decoder, decoder_start_token, max_length=MAX_LENGTH):
+    loss = 0
+
+    for iter, batch in enumerate(getBatch(config.batch_size, test_data)):
+        x, y_1, y_2 = zip(*batch)
+        input_tensor = torch.cat(x)
+        target_tensor = torch.cat(y_1)
+
+        # loss += trainny(input_tensor, target_tensor, encoder, decoder, decode_start_token)
+
+    print("Total loss", loss)
 
 def train(config):    
     # train_data, word2index, tag2index, intent2index = preprocessing(config.file_path, config.max_length)
-    train_data, word_labeler, tag_labeler, intent_labeler = preprocessing(config.file_path, config.max_length)
+    all_data, word_labeler, tag_labeler, intent_labeler = preprocessing(config.file_path, config.max_length)
 
     num_words = len(word_labeler.classes_)
     num_slots = len(tag_labeler.classes_)
@@ -143,9 +162,14 @@ def train(config):
     attn_decoder1 = AttnDecoderRNN(num_slots, num_intent, config.embedding_size, config.hidden_size)
     decode_start_token = tag_labeler.transform([SOS])[0]
 
-    trainIters(encoder1, attn_decoder1, 5000, train_data, decode_start_token, print_every=500)
+    pct = int(len(all_data) * 0.7)
+    train_data = all_data[:pct]
+    test_data = all_data[pct:]
 
-def trainIters(encoder, decoder, n_iters, train_data, decode_start_token, print_every=1000, plot_every=100, learning_rate=0.01):
+    trainIters(encoder1, attn_decoder1, 50, train_data, decode_start_token, print_every=500)
+    # evaluate(test_data, encoder1, attn_decoder1, decode_start_token)
+
+def trainIters(encoder, decoder, n_iters, train_data, decode_start_token, print_every=1, plot_every=100, learning_rate=0.01):
     start = time.time()
     plot_losses = []
     print_loss_total = 0  # Reset every print_every
@@ -154,29 +178,24 @@ def trainIters(encoder, decoder, n_iters, train_data, decode_start_token, print_
     encoder_optimizer = optim.SGD(encoder.parameters(), lr=learning_rate)
     decoder_optimizer = optim.SGD(decoder.parameters(), lr=learning_rate)
 
+    # criterion = nn.CrossEntropyLoss(ignore_index=0)
     criterion = nn.NLLLoss()
 
-    for i, batch in enumerate(getBatch(config.batch_size, train_data)):
-        x, y_1, y_2 = zip(*batch)
-        input_tensor = torch.cat(x)
-        target_tensor = torch.cat(y_1)
+    for iter in range(n_iters):
+        for _, batch in enumerate(getBatch(config.batch_size, train_data)):
+            x, y_1, y_2 = zip(*batch)
+            input_tensor = torch.cat(x)
+            target_tensor = torch.cat(y_1)
 
-        loss = trainny(input_tensor, target_tensor, encoder,
-                     decoder, encoder_optimizer, decoder_optimizer, criterion, decode_start_token)
+            loss = trainny(input_tensor, target_tensor, encoder,
+                        decoder, encoder_optimizer, decoder_optimizer, criterion, decode_start_token)
 
-        print_loss_total += loss
-        plot_loss_total += loss
+            print_loss_total += loss
 
-        if iter % print_every == 0:
-            print_loss_avg = print_loss_total / print_every
-            print_loss_total = 0
-            print('%s (%d %d%%) %.4f' % (timeSince(start, iter / n_iters),
-                                         iter, iter / n_iters * 100, print_loss_avg))
-
-        if iter % plot_every == 0:
-            plot_loss_avg = plot_loss_total / plot_every
-            plot_losses.append(plot_loss_avg)
-            plot_loss_total = 0
+        # if iter % print_every == 0:
+        # print_loss_avg = print_loss_total / print_every
+        print("Iteration", iter, "loss", print_loss_total)
+        print_loss_total = 0
 
     showPlot(plot_losses)
 
